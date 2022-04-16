@@ -13,7 +13,7 @@ class IndexedWalks(object):
 
         self._index = {}
 
-        print("Building entity<->walks index.")
+        #print("Building entity<->walks index.")
         for walk_group in tqdm(walks):
             for walk in walk_group:
                 for entity in entities:

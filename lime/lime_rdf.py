@@ -79,7 +79,12 @@ class LimeRdfExplainer(object):
 
         # TODO retrieve explanations from lime base
 
-    def __data_labels_distances(self, entity, classifier_fn, num_samples, max_removed_triples=None, distance_metric="cosine"):
+    def __data_labels_distances(self, entity, classifier_fn, num_samples,
+                                max_removed_triples=None,
+                                removal_count_fixed=True,
+                                use_w2v_freeze=True,
+                                center_correction=True,
+                                distance_metric="cosine"):
         """Generates a neighborhood around a prediction.
 
         Generates neighborhood data by removing random triples from
@@ -88,96 +93,99 @@ class LimeRdfExplainer(object):
         """
 
         def distance_fn(x):
-            return sklearn.metrics.pairwise.pairwise_distances(x, x[0], metric=distance_metric).ravel() * 100
+            return sklearn.metrics.pairwise.pairwise_distances(
+                x, x[0], metric=distance_metric).ravel() * 100
 
         originalWalks = self.indexedWalks.walks(entity)
         originalTriples = list(IndexedWalks.walks_as_triples(originalWalks))
-        tripleCount = len(originalTriples)
+        triple_count = len(originalTriples)
 
         num_samples = int(num_samples)
         max_removed_triples = int(max_removed_triples)
 
         # How many triples to remove in a specific perturbed sample
         if max_removed_triples is None:
-            max_removed_triples = tripleCount
+            max_removed_triples = triple_count
 
-        # TODO Allow random number of samples to be removed -> see Value Error below
-        sample = np.ones(num_samples, dtype=np.int64) * max_removed_triples
-        # sample = self.random_state.randint(1, max_removed_triples + 1, num_samples)
+        if removal_count_fixed:
+            # Always remove fixed number of triples given in parameter removal_count_fixed
+            sample = np.ones(num_samples, dtype=np.int64) * max_removed_triples
+        else:
+            # Draw the number of removed triples for each perturbed entity at random
+            sample = self.random_state.randint(1, max_removed_triples + 1, num_samples)
 
         # Mark random triples as removed, creating a new corpus for artificial entities
-        data = np.ones((num_samples, tripleCount))
-        newEntities = [f"{entity}_{i}" for i in range(num_samples)]
-        newCorpus = []
+        data = np.ones((num_samples, triple_count))
+        new_entities = [f"{entity}_{i}" for i in range(num_samples)]
+        new_corpus = []
 
-        for i, nRemove in enumerate(tqdm(sample)):
+        for i, removal_count in enumerate(tqdm(sample)):
 
+            # Choose inactive triple for this perturbed sample
+            # Special case: first sample is a reference without changes
             inactive = self.random_state.choice(
-                range(tripleCount), nRemove, replace=False) if i != 0 else []
+                range(triple_count), removal_count, replace=False) if i != 0 else []
             data[i, inactive] = 0
 
             # Build new corpus by removing walks that contain inactive triples
-            removedTriples = [t for i, t in enumerate(originalTriples) if i in inactive]
-            remainingWalks = []
+            removed_triples = [t for i, t in enumerate(originalTriples) if i in inactive]
+            remaining_walks = []
 
             for walk in originalWalks:
                 walkTriples = IndexedWalks.walk_as_triples(walk)
 
-                if any([removed in walkTriples for removed in removedTriples]):
+                if any([removed in walkTriples for removed in removed_triples]):
                     continue
 
                 # Rename entity of interest
-                modifiedWalk = [newEntities[i] if e == entity else e for e in walk]
+                modifiedWalk = [new_entities[i] if e == entity else e for e in walk]
 
-                remainingWalks.append(modifiedWalk)
+                remaining_walks.append(modifiedWalk)
 
-            newCorpus.append(remainingWalks)
+            new_corpus.append(remaining_walks)
 
-        averageWalks = sum([len(x) for x in newCorpus])/len(newCorpus)
-        logging.info(f"Average remaining walks per artificial entity (from 484): {averageWalks}")
+        average_walks = sum([len(x) for x in new_corpus])/len(new_corpus)
+        logging.warn(f"Average remaining walks per artificial entity (from 484): {average_walks}")
 
         # Get embeddings for new entities
 
-        # TODO
         """
-        corpus = [walk for entity_walks in walks for walk in entity_walks]
-        self._model.build_vocab(corpus, update=is_update)
-        self._model.train(
-            corpus,
-            total_examples=self._model.corpus_count,
-            epochs=self._model.epochs,
-        )
-        """
-        model = self.transformer.embedder._model
-        wv = model.wv
-
-        #locked = np.zeros(len(wv))
-
-        addition = [walk for entity_walks in newCorpus for walk in entity_walks]
-        model.build_vocab(addition, update=True)
-
-        """
-        open = np.ones(len(wv)-len(locked))
-        model.wv.vectors_lockf = np.concatenate([locked, open])
+        For now we ignore some of the RDF2Vec wrapper functions and talk to W2V directly
+        (to use advanced features such as the freeze functionality)
+        self.transformer.fit(newCorpus, is_update=True)
+        self.transformer._update(self.transformer._embeddings, embeddings)
         """
 
-        model.train(addition, total_examples=model.corpus_count, epochs=model.epochs)
+        w2v = self.transformer.embedder._model
+        wv = w2v.wv
+        original_embedding = wv.get_vector(entity)
 
-        # Changing epochs did not help
-        # self.transformer.fit(newCorpus, is_update=True)
+        freeze_vector_locked = np.zeros(len(wv))
 
-        entities = newEntities  # self.entities + newEntities
+        addition = [walk for entity_walks in new_corpus for walk in entity_walks]
+        w2v.build_vocab(addition, update=True)
 
-        # TODO when corpus contains entitites with all walks removed, throws Value Error (entities must have been provided to fit first)
-        embeddings = self.transformer.embedder.transform(entities)
+        freeze_vector_open = np.ones(len(wv)-len(freeze_vector_locked))
+        if use_w2v_freeze:
+            w2v.wv.vectors_lockf = np.concatenate([freeze_vector_locked, freeze_vector_open])
 
-        # self.transformer._update(self.transformer._embeddings, embeddings)
+        # TODO Throws Value Error when corpus contains entitites with all walks removed
+        # ("entities must have been provided to fit first") -> ensure we never remove all walks
+        #
+        # Also: displays warning "effective 'Alpha' higher than previous cycles"
+        w2v.train(addition, total_examples=w2v.corpus_count, epochs=w2v.epochs)
 
-        # Get predictions for new embeddings
+        new_embeddings = self.transformer.embedder.transform(new_entities)
+
+        if center_correction:
+            diff_to_center = new_embeddings[0] - original_embedding
+            embeddings = [e - diff_to_center for e in new_embeddings]
+
+        # Get prediction probabilities for new embeddings
         labels = classifier_fn(embeddings)
 
         # Determine distances
-        distances = distance_fn(sp.sparse)
+        distances = distance_fn(sp.sparse.csr_matrix(embeddings))
 
         return data, labels, distances
 

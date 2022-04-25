@@ -2,16 +2,16 @@
 Functions for explaining classifiers based on knowledge graph embeddings.
 """
 
-from copy import deepcopy
 import numpy as np
+import scipy as sp
 from tqdm import tqdm
 import itertools
+import sklearn
 from sklearn.utils import check_random_state
 from pyrdf2vec import RDF2VecTransformer
 import logging
 import pickle
 
-import time
 
 logging.basicConfig(level=logging.WARN)
 
@@ -49,7 +49,7 @@ class IndexedWalks(object):
 
     @staticmethod
     def walks_as_triples(walks):
-        """Returns the set of all triples within a given list of walks."""
+        """Returns the set of distinct triples within a given list of walks."""
         walkLists = [IndexedWalks.walk_as_triples(walk) for walk in walks]
         return set(itertools.chain.from_iterable(walkLists))
 
@@ -79,13 +79,17 @@ class LimeRdfExplainer(object):
 
         # TODO retrieve explanations from lime base
 
-    def __data_labels_distances(self, entity, classifier_fn, num_samples, max_removed_triples=None):
+    def __data_labels_distances(self, entity, classifier_fn, num_samples, max_removed_triples=None, distance_metric="cosine"):
         """Generates a neighborhood around a prediction.
 
         Generates neighborhood data by removing random triples from
         the instance, and predicting with the classifier. Triples are
         removed by eliminating all walks that contain them.
         """
+
+        def distance_fn(x):
+            return sklearn.metrics.pairwise.pairwise_distances(x, x[0], metric=distance_metric).ravel() * 100
+
         originalWalks = self.indexedWalks.walks(entity)
         originalTriples = list(IndexedWalks.walks_as_triples(originalWalks))
         tripleCount = len(originalTriples)
@@ -97,14 +101,13 @@ class LimeRdfExplainer(object):
         if max_removed_triples is None:
             max_removed_triples = tripleCount
 
-        # sample = self.random_state.randint(1, max_removed_triples + 1, num_samples)
-
-        # !!!!! TODO !!!!!
+        # TODO Allow random number of samples to be removed -> see Value Error below
         sample = np.ones(num_samples, dtype=np.int64) * max_removed_triples
+        # sample = self.random_state.randint(1, max_removed_triples + 1, num_samples)
 
         # Mark random triples as removed, creating a new corpus for artificial entities
         data = np.ones((num_samples, tripleCount))
-        newEntities = [f"{entity}*{i}*" for i in range(num_samples)]
+        newEntities = [f"{entity}_{i}" for i in range(num_samples)]
         newCorpus = []
 
         for i, nRemove in enumerate(tqdm(sample)):
@@ -124,7 +127,7 @@ class LimeRdfExplainer(object):
                     continue
 
                 # Rename entity of interest
-                modifiedWalk = [f"{e}*{i}*" if e == entity else e for e in walk]
+                modifiedWalk = [newEntities[i] if e == entity else e for e in walk]
 
                 remainingWalks.append(modifiedWalk)
 
@@ -135,22 +138,7 @@ class LimeRdfExplainer(object):
 
         # Get embeddings for new entities
 
-        # fit expects walks as
-        """
-        [
-            [ #entity1
-                (s, v, o, v, o2, ...),
-                (s, v, o, v, o2, ...)
-            ],
-
-            [ #entity2
-
-            ]
-        ]
-        """
-
-        # TODO !!!!!!!
-
+        # TODO
         """
         corpus = [walk for entity_walks in walks for walk in entity_walks]
         self._model.build_vocab(corpus, update=is_update)
@@ -163,13 +151,15 @@ class LimeRdfExplainer(object):
         model = self.transformer.embedder._model
         wv = model.wv
 
-        locked = np.zeros(len(wv))
+        #locked = np.zeros(len(wv))
 
         addition = [walk for entity_walks in newCorpus for walk in entity_walks]
         model.build_vocab(addition, update=True)
 
+        """
         open = np.ones(len(wv)-len(locked))
         model.wv.vectors_lockf = np.concatenate([locked, open])
+        """
 
         model.train(addition, total_examples=model.corpus_count, epochs=model.epochs)
 
@@ -181,13 +171,15 @@ class LimeRdfExplainer(object):
         # TODO when corpus contains entitites with all walks removed, throws Value Error (entities must have been provided to fit first)
         embeddings = self.transformer.embedder.transform(entities)
 
-        self.transformer._update(self.transformer._embeddings, embeddings)
-        return (data, embeddings, newCorpus)
+        # self.transformer._update(self.transformer._embeddings, embeddings)
+
         # Get predictions for new embeddings
+        labels = classifier_fn(embeddings)
 
         # Determine distances
+        distances = distance_fn(sp.sparse)
 
-        # Return
+        return data, labels, distances
 
 
 if __name__ == "__main__":

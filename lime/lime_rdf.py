@@ -9,6 +9,9 @@ import itertools
 from sklearn.utils import check_random_state
 from pyrdf2vec import RDF2VecTransformer
 import logging
+import pickle
+
+import time
 
 logging.basicConfig(level=logging.WARN)
 
@@ -57,7 +60,10 @@ class LimeRdfExplainer(object):
     def __init__(self, transformer: RDF2VecTransformer, entities, random_state=None):
         """Initializer."""
         print("Hello, world!")
-        self.oldTransformer = deepcopy(transformer)
+
+        # Can safely do this since transformer object is serializable by design
+        self.oldTransformer = pickle.loads(pickle.dumps(transformer))
+
         self.transformer = transformer
 
         self.embeddings = transformer._embeddings
@@ -84,13 +90,17 @@ class LimeRdfExplainer(object):
         originalTriples = list(IndexedWalks.walks_as_triples(originalWalks))
         tripleCount = len(originalTriples)
 
+        num_samples = int(num_samples)
+        max_removed_triples = int(max_removed_triples)
+
         # How many triples to remove in a specific perturbed sample
-        if not max_removed_triples:
+        if max_removed_triples is None:
             max_removed_triples = tripleCount
-        sample = self.random_state.randint(1, max_removed_triples + 1, num_samples)
+
+        # sample = self.random_state.randint(1, max_removed_triples + 1, num_samples)
 
         # !!!!! TODO !!!!!
-        sample = np.ones(num_samples, dtype=np.int64)
+        sample = np.ones(num_samples, dtype=np.int64) * max_removed_triples
 
         # Mark random triples as removed, creating a new corpus for artificial entities
         data = np.ones((num_samples, tripleCount))
@@ -107,14 +117,10 @@ class LimeRdfExplainer(object):
             removedTriples = [t for i, t in enumerate(originalTriples) if i in inactive]
             remainingWalks = []
 
-            print("-----\n", i, nRemove)
-            print(removedTriples, "removed")
-
             for walk in originalWalks:
                 walkTriples = IndexedWalks.walk_as_triples(walk)
 
                 if any([removed in walkTriples for removed in removedTriples]):
-                    print(walk, "removed")
                     continue
 
                 # Rename entity of interest
@@ -142,7 +148,33 @@ class LimeRdfExplainer(object):
             ]
         ]
         """
-        self.transformer.fit(newCorpus, is_update=True)
+
+        # TODO !!!!!!!
+
+        """
+        corpus = [walk for entity_walks in walks for walk in entity_walks]
+        self._model.build_vocab(corpus, update=is_update)
+        self._model.train(
+            corpus,
+            total_examples=self._model.corpus_count,
+            epochs=self._model.epochs,
+        )
+        """
+        model = self.transformer.embedder._model
+        wv = model.wv
+
+        locked = np.zeros(len(wv))
+
+        addition = [walk for entity_walks in newCorpus for walk in entity_walks]
+        model.build_vocab(addition, update=True)
+
+        open = np.ones(len(wv)-len(locked))
+        model.wv.vectors_lockf = np.concatenate([locked, open])
+
+        model.train(addition, total_examples=model.corpus_count, epochs=model.epochs)
+
+        # Changing epochs did not help
+        # self.transformer.fit(newCorpus, is_update=True)
 
         entities = newEntities  # self.entities + newEntities
 
@@ -159,7 +191,6 @@ class LimeRdfExplainer(object):
 
 
 if __name__ == "__main__":
-    import pickle
     import os
     import pandas as pd
 

@@ -62,20 +62,32 @@ class LimeRdfExplainer(object):
         print("Hello, world!")
 
         # Can safely do this since transformer object is serializable by design
-        self.oldTransformer = pickle.loads(pickle.dumps(transformer))
+        self.old_transformer = pickle.loads(pickle.dumps(transformer))
 
         self.transformer = transformer
 
         self.embeddings = transformer._embeddings
         self.entities = entities
-        self.indexedWalks = IndexedWalks(entities, transformer._walks, strict_mode=False)
+        self.indexed_walks = IndexedWalks(entities, transformer._walks, strict_mode=False)
         self.random_state = check_random_state(random_state)
 
-    def explain_instance(self, entity, classifier_fn, num_samples, max_removed_triples=None):
+    def explain_instance(self, entity, classifier_fn, num_samples,
+                         max_removed_triples=None,
+                         removal_count_fixed=True,
+                         use_w2v_freeze=True,
+                         center_correction=True,
+                         distance_metric="cosine"):
         """Generates explanations for a prediction."""
 
         # Generate and evaluate random neighborhood
-        return self.__data_labels_distances(entity, classifier_fn, num_samples, max_removed_triples)
+        return self.__data_labels_distances(entity,
+                                            classifier_fn,
+                                            num_samples,
+                                            max_removed_triples,
+                                            removal_count_fixed,
+                                            use_w2v_freeze,
+                                            center_correction,
+                                            distance_metric)
 
         # TODO retrieve explanations from lime base
 
@@ -96,9 +108,9 @@ class LimeRdfExplainer(object):
             return sklearn.metrics.pairwise.pairwise_distances(
                 x, x[0], metric=distance_metric).ravel() * 100
 
-        originalWalks = self.indexedWalks.walks(entity)
-        originalTriples = list(IndexedWalks.walks_as_triples(originalWalks))
-        triple_count = len(originalTriples)
+        original_walks = self.indexed_walks.walks(entity)
+        original_triples = list(IndexedWalks.walks_as_triples(original_walks))
+        triple_count = len(original_triples)
 
         num_samples = int(num_samples)
         max_removed_triples = int(max_removed_triples)
@@ -128,10 +140,10 @@ class LimeRdfExplainer(object):
             data[i, inactive] = 0
 
             # Build new corpus by removing walks that contain inactive triples
-            removed_triples = [t for i, t in enumerate(originalTriples) if i in inactive]
+            removed_triples = [t for i, t in enumerate(original_triples) if i in inactive]
             remaining_walks = []
 
-            for walk in originalWalks:
+            for walk in original_walks:
                 walkTriples = IndexedWalks.walk_as_triples(walk)
 
                 if any([removed in walkTriples for removed in removed_triples]):
@@ -154,6 +166,7 @@ class LimeRdfExplainer(object):
         (to use advanced features such as the freeze functionality)
         self.transformer.fit(newCorpus, is_update=True)
         self.transformer._update(self.transformer._embeddings, embeddings)
+        new_embeddings = self.transformer.embedder.transform(new_entities)
         """
 
         w2v = self.transformer.embedder._model
@@ -168,6 +181,7 @@ class LimeRdfExplainer(object):
         freeze_vector_open = np.ones(len(wv)-len(freeze_vector_locked))
         if use_w2v_freeze:
             w2v.wv.vectors_lockf = np.concatenate([freeze_vector_locked, freeze_vector_open])
+            print(len(freeze_vector_locked), len(freeze_vector_open))
 
         # TODO Throws Value Error when corpus contains entitites with all walks removed
         # ("entities must have been provided to fit first") -> ensure we never remove all walks
@@ -175,17 +189,20 @@ class LimeRdfExplainer(object):
         # Also: displays warning "effective 'Alpha' higher than previous cycles"
         w2v.train(addition, total_examples=w2v.corpus_count, epochs=w2v.epochs)
 
-        new_embeddings = self.transformer.embedder.transform(new_entities)
+        new_embeddings = [wv.get_vector(entity) for entity in new_entities]
 
         if center_correction:
             diff_to_center = new_embeddings[0] - original_embedding
-            embeddings = [e - diff_to_center for e in new_embeddings]
+            new_embeddings = [e - diff_to_center for e in new_embeddings]
 
         # Get prediction probabilities for new embeddings
-        labels = classifier_fn(embeddings)
+        labels = classifier_fn(new_embeddings)
 
         # Determine distances
-        distances = distance_fn(sp.sparse.csr_matrix(embeddings))
+        distances = distance_fn(sp.sparse.csr_matrix(new_embeddings))
+
+        # Debug
+        self.new_corpus = new_corpus
 
         return data, labels, distances
 

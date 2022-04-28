@@ -22,17 +22,19 @@ logging.basicConfig(level=logging.WARN)
 class GraphDomainMapper(explanation.DomainMapper):
     """Maps feature ids to triples"""
 
-    def __init__(self, triples):
+    def __init__(self, triples, short_uris):
         self.triples = triples
+        self.short_uris = short_uris
 
     def map_exp_ids(self, exp, **kwargs):
         mappings = []
+
         for x in exp:
             triple = self.triples[x[0]]
-            triple = [i.split("/")[-1] for i in list(triple)]
+            triple = [i.split("/")[-1] if self.short_uris else i for i in list(triple)]
             mappings.append((triple, x[1]))
 
-        #a = [([list(self.triples[x[0]])], x[1]) for x in exp]
+        # a = [([list(self.triples[x[0]])], x[1]) for x in exp]
         return mappings
 
 
@@ -119,7 +121,8 @@ class LimeRdfExplainer(object):
                          use_w2v_freeze=True,
                          center_correction=True,
                          distance_metric="cosine",
-                         model_regressor=None):
+                         model_regressor=None,
+                         short_uris=False):
         """Generates explanations for a prediction."""
 
         # Generate and evaluate random neighborhood
@@ -133,7 +136,7 @@ class LimeRdfExplainer(object):
                                                             distance_metric)
 
         relevant_triples = IndexedWalks.walks_as_triples(self.indexed_walks.walks(entity))
-        domain_mapper = GraphDomainMapper(list(relevant_triples))
+        domain_mapper = GraphDomainMapper(list(relevant_triples), short_uris)
         ret_exp = explanation.Explanation(
             domain_mapper,
             mode="classification",
@@ -270,6 +273,7 @@ class LimeRdfExplainer(object):
 
         # Debug
         self.new_corpus = new_corpus
+        self.new_embeddings = new_embeddings
 
         return data, labels, distances
 

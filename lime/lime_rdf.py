@@ -2,6 +2,8 @@
 Functions for explaining classifiers based on knowledge graph embeddings.
 """
 
+from functools import partial
+from lime import lime_base
 import numpy as np
 import scipy as sp
 from tqdm import tqdm
@@ -12,8 +14,26 @@ from pyrdf2vec import RDF2VecTransformer
 import logging
 import pickle
 
+from . import explanation
 
 logging.basicConfig(level=logging.WARN)
+
+
+class GraphDomainMapper(explanation.DomainMapper):
+    """Maps feature ids to triples"""
+
+    def __init__(self, triples):
+        self.triples = triples
+
+    def map_exp_ids(self, exp, **kwargs):
+        mappings = []
+        for x in exp:
+            triple = self.triples[x[0]]
+            triple = [i.split("/")[-1] for i in list(triple)]
+            mappings.append((triple, x[1]))
+
+        #a = [([list(self.triples[x[0]])], x[1]) for x in exp]
+        return mappings
 
 
 class IndexedWalks(object):
@@ -57,9 +77,21 @@ class IndexedWalks(object):
 class LimeRdfExplainer(object):
     """Explains classifiers based on knowledge graph embeddings."""
 
-    def __init__(self, transformer: RDF2VecTransformer, entities, random_state=None):
+    def __init__(self,
+                 transformer: RDF2VecTransformer,
+                 entities,
+                 class_names=None,
+                 kernel=None,
+                 kernel_width=25,
+                 verbose=False,
+                 feature_selection="auto",
+                 random_state=None):
         """Initializer."""
-        print("Hello, world!")
+
+        if kernel is None:
+            def kernel(d, kernel_width):
+                return np.sqrt(np.exp(-(d ** 2) / kernel_width ** 2))
+        kernel_fn = partial(kernel, kernel_width=kernel_width)
 
         # Can safely do this since transformer object is serializable by design
         self.old_transformer = pickle.loads(pickle.dumps(transformer))
@@ -71,23 +103,57 @@ class LimeRdfExplainer(object):
         self.indexed_walks = IndexedWalks(entities, transformer._walks, strict_mode=False)
         self.random_state = check_random_state(random_state)
 
-    def explain_instance(self, entity, classifier_fn, num_samples,
+        self.class_names = class_names
+        self.feature_selection = feature_selection
+
+        self.base = lime_base.LimeBase(kernel_fn, verbose, self.random_state)
+
+    def explain_instance(self,
+                         entity,
+                         classifier_fn,
+                         labels=(1,),
+                         num_features=10,
+                         num_samples=5000,
                          max_removed_triples=None,
                          removal_count_fixed=True,
                          use_w2v_freeze=True,
                          center_correction=True,
-                         distance_metric="cosine"):
+                         distance_metric="cosine",
+                         model_regressor=None):
         """Generates explanations for a prediction."""
 
         # Generate and evaluate random neighborhood
-        return self.__data_labels_distances(entity,
-                                            classifier_fn,
-                                            num_samples,
-                                            max_removed_triples,
-                                            removal_count_fixed,
-                                            use_w2v_freeze,
-                                            center_correction,
-                                            distance_metric)
+        data, yss, distances = self.__data_labels_distances(entity,
+                                                            classifier_fn,
+                                                            num_samples,
+                                                            max_removed_triples,
+                                                            removal_count_fixed,
+                                                            use_w2v_freeze,
+                                                            center_correction,
+                                                            distance_metric)
+
+        relevant_triples = IndexedWalks.walks_as_triples(self.indexed_walks.walks(entity))
+        domain_mapper = GraphDomainMapper(list(relevant_triples))
+        ret_exp = explanation.Explanation(
+            domain_mapper,
+            mode="classification",
+            class_names=self.class_names,
+            random_state=self.random_state)
+        ret_exp.predict_proba = yss[0]
+
+        """if top_labels..."""
+
+        for label in labels:
+            (ret_exp.intercept[label],
+             ret_exp.local_exp[label],
+             ret_exp.score[label],
+             ret_exp.local_pred[label]) = self.base.explain_instance_with_data(
+                 data, yss, distances, label, num_features,
+                 feature_selection=self.feature_selection,
+                 model_regressor=model_regressor
+            )
+
+        return data, yss, distances, ret_exp
 
         # TODO retrieve explanations from lime base
 
@@ -147,6 +213,7 @@ class LimeRdfExplainer(object):
                 walkTriples = IndexedWalks.walk_as_triples(walk)
 
                 if any([removed in walkTriples for removed in removed_triples]):
+                    # TODO should we also mark "collateral damage" triples as removed?
                     continue
 
                 # Rename entity of interest
@@ -157,7 +224,7 @@ class LimeRdfExplainer(object):
             new_corpus.append(remaining_walks)
 
         average_walks = sum([len(x) for x in new_corpus])/len(new_corpus)
-        logging.warn(f"Average remaining walks per artificial entity (from 484): {average_walks}")
+        print(f"Average remaining walks per artificial entity (from 484): {average_walks}")
 
         # Get embeddings for new entities
 
@@ -208,6 +275,7 @@ class LimeRdfExplainer(object):
 
 
 if __name__ == "__main__":
+    """
     import os
     import pandas as pd
 
@@ -219,3 +287,38 @@ if __name__ == "__main__":
 
     explainer = LimeRdfExplainer(t, movies)
     explainer.explain_instance(movies[123], None)
+    """
+    import os
+    import pandas as pd
+    from importlib import reload
+
+    moviePath = "/workspaces/rdflime/rdflime-util/data/metacritic-movies"
+    movieFull = pd.read_csv(os.path.join(moviePath, "movies_fixed.tsv"), sep="\t")
+    movies = [movie.DBpedia_URI for index, movie in movieFull.iterrows()]
+
+    with open(os.path.join(moviePath, "rdf2vec_transformer_cbow_200"), "rb") as f:
+        rdf2vec_transformer = pickle.load(f)
+
+    with open(os.path.join(moviePath, "embedding_classifier_cbow_200"), "rb") as file:
+        clf = pickle.load(file)
+
+    explainer = LimeRdfExplainer(
+        transformer=rdf2vec_transformer,
+        entities=movies
+    )
+    explained_entity_uri = movies[10]
+
+    print("Explaining", explained_entity_uri)
+
+    data, labels, distances, expl = explainer.explain_instance(
+        entity=explained_entity_uri,
+        classifier_fn=clf.predict_proba,
+        num_samples=10,
+        max_removed_triples=3,
+        removal_count_fixed=True,
+        use_w2v_freeze=False,
+        center_correction=True,
+        distance_metric="cosine"
+    )
+
+    print(expl.as_list())

@@ -19,6 +19,11 @@ from . import explanation
 logging.basicConfig(level=logging.WARN)
 
 
+def pclone(o):
+    # poor man's deep copy
+    return pickle.loads(pickle.dumps(o))
+
+
 class GraphDomainMapper(explanation.DomainMapper):
     """Maps feature ids to triples"""
 
@@ -120,6 +125,7 @@ class LimeRdfExplainer(object):
                          removal_count_fixed=True,
                          use_w2v_freeze=True,
                          center_correction=True,
+                         single_run=True,
                          distance_metric="cosine",
                          model_regressor=None,
                          short_uris=False):
@@ -133,6 +139,7 @@ class LimeRdfExplainer(object):
                                                             removal_count_fixed,
                                                             use_w2v_freeze,
                                                             center_correction,
+                                                            single_run,
                                                             distance_metric)
 
         relevant_triples = IndexedWalks.walks_as_triples(self.indexed_walks.walks(entity))
@@ -165,6 +172,7 @@ class LimeRdfExplainer(object):
                                 removal_count_fixed=True,
                                 use_w2v_freeze=True,
                                 center_correction=True,
+                                single_run=True,
                                 distance_metric="cosine"):
         """Generates a neighborhood around a prediction.
 
@@ -243,23 +251,40 @@ class LimeRdfExplainer(object):
         wv = w2v.wv
         original_embedding = wv.get_vector(entity)
 
-        freeze_vector_locked = np.zeros(len(wv))
+        freeze_vector_locked = np.zeros(len(wv), dtype=np.float32)
 
-        addition = [walk for entity_walks in new_corpus for walk in entity_walks]
-        w2v.build_vocab(addition, update=True)
+        new_embeddings = []
+        runs = []
 
-        freeze_vector_open = np.ones(len(wv)-len(freeze_vector_locked))
-        if use_w2v_freeze:
-            w2v.wv.vectors_lockf = np.concatenate([freeze_vector_locked, freeze_vector_open])
-            print(len(freeze_vector_locked), len(freeze_vector_open))
+        if single_run:
+            runs.append([walk for entity_walks in new_corpus for walk in entity_walks])
+        else:
+            for entity_walk in new_corpus:
+                runs.append([walk for walk in entity_walk])
 
-        # TODO Throws Value Error when corpus contains entitites with all walks removed
-        # ("entities must have been provided to fit first") -> ensure we never remove all walks
-        #
-        # Also: displays warning "effective 'Alpha' higher than previous cycles"
-        w2v.train(addition, total_examples=w2v.corpus_count, epochs=w2v.epochs)
+        for i, run in enumerate(tqdm(runs)):
+            w2v = pclone(self.transformer.embedder._model)
+            wv = w2v.wv
 
-        new_embeddings = [wv.get_vector(entity) for entity in new_entities]
+            w2v.build_vocab(run, update=True)
+
+            run_entities = new_entities if single_run else [new_entities[i]]
+
+            freeze_vector_open = np.ones(len(wv)-len(freeze_vector_locked), dtype=np.float32)
+            if use_w2v_freeze:
+                w2v.wv.vectors_lockf = np.concatenate([freeze_vector_locked, freeze_vector_open])
+                print(len(freeze_vector_locked), len(freeze_vector_open))
+
+            # TODO Throws Value Error when corpus contains entitites with all walks removed
+            # ("entities must have been provided to fit first") -> ensure we never remove all walks
+            #
+            # Also: displays warning "effective 'Alpha' higher than previous cycles"
+            w2v.train(run, total_examples=w2v.corpus_count,
+                      epochs=w2v.epochs)  # , start_alpha=w2v.min_alpha)
+
+            # Add embedding of fake entity to our collection
+            # Need to clone vector to avoid memory leak in multi run scenario
+            new_embeddings += [pclone(wv.get_vector(entity)) for entity in run_entities]
 
         if center_correction:
             diff_to_center = new_embeddings[0] - original_embedding
@@ -317,11 +342,12 @@ if __name__ == "__main__":
     data, labels, distances, expl = explainer.explain_instance(
         entity=explained_entity_uri,
         classifier_fn=clf.predict_proba,
-        num_samples=10,
+        num_samples=500,
         max_removed_triples=3,
         removal_count_fixed=True,
         use_w2v_freeze=False,
         center_correction=True,
+        single_run=False,
         distance_metric="cosine"
     )
 

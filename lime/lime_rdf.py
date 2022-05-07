@@ -126,6 +126,7 @@ class LimeRdfExplainer(object):
                          use_w2v_freeze=True,
                          center_correction=True,
                          single_run=True,
+                         train_with_all=False,
                          distance_metric="cosine",
                          model_regressor=None,
                          short_uris=False):
@@ -140,6 +141,7 @@ class LimeRdfExplainer(object):
                                                             use_w2v_freeze,
                                                             center_correction,
                                                             single_run,
+                                                            train_with_all,
                                                             distance_metric)
 
         relevant_triples = IndexedWalks.walks_as_triples(self.indexed_walks.walks(entity))
@@ -165,14 +167,13 @@ class LimeRdfExplainer(object):
 
         return data, yss, distances, ret_exp
 
-        # TODO retrieve explanations from lime base
-
     def __data_labels_distances(self, entity, classifier_fn, num_samples,
                                 max_removed_triples=None,
                                 removal_count_fixed=True,
                                 use_w2v_freeze=True,
                                 center_correction=True,
                                 single_run=True,
+                                train_with_all=False,
                                 distance_metric="cosine"):
         """Generates a neighborhood around a prediction.
 
@@ -256,15 +257,19 @@ class LimeRdfExplainer(object):
         new_embeddings = []
         runs = []
 
-        if single_run:
-            runs.append([walk for entity_walks in new_corpus for walk in entity_walks])
+        if single_run:  # TODO !
+            runs.append([tuple(walk) for entity_walks in new_corpus for walk in entity_walks])
         else:
             for entity_walk in new_corpus:
-                runs.append([walk for walk in entity_walk])
+                runs.append([tuple(walk) for walk in entity_walk])
 
         for i, run in enumerate(tqdm(runs)):
             w2v = pclone(self.transformer.embedder._model)
             wv = w2v.wv
+
+            if(train_with_all):
+                run = [tuple(walk)
+                       for entity_walks in self.transformer._walks for walk in entity_walks] + run
 
             w2v.build_vocab(run, update=True)
 
@@ -272,6 +277,7 @@ class LimeRdfExplainer(object):
 
             freeze_vector_open = np.ones(len(wv)-len(freeze_vector_locked), dtype=np.float32)
             if use_w2v_freeze:
+                # TODO maybe freeze depends on the length of input to train (which is not always the length of the whole corpus)
                 w2v.wv.vectors_lockf = np.concatenate([freeze_vector_locked, freeze_vector_open])
                 print(len(freeze_vector_locked), len(freeze_vector_open))
 
@@ -279,8 +285,9 @@ class LimeRdfExplainer(object):
             # ("entities must have been provided to fit first") -> ensure we never remove all walks
             #
             # Also: displays warning "effective 'Alpha' higher than previous cycles"
+
             w2v.train(run, total_examples=w2v.corpus_count,
-                      epochs=w2v.epochs)  # , start_alpha=w2v.min_alpha)
+                      epochs=w2v.epochs)  # , start_alpha=w2v.min_alpha) TODO
 
             # Add embedding of fake entity to our collection
             # Need to clone vector to avoid memory leak in multi run scenario
@@ -304,51 +311,48 @@ class LimeRdfExplainer(object):
 
 
 if __name__ == "__main__":
-    """
     import os
     import pandas as pd
-
-    moviePath = "/workspaces/rdflime/rdflime-util/data/metacritic-movies"
-    with open(os.path.join(moviePath, "rdf2vec_transformer_cbow_50"), "rb") as f:
-        t = pickle.load(f)
-    movieFull = pd.read_csv(os.path.join(moviePath, "movies_fixed.tsv"), sep="\t")
-    movies = [movie.DBpedia_URI for index, movie in movieFull.iterrows()]
-
-    explainer = LimeRdfExplainer(t, movies)
-    explainer.explain_instance(movies[123], None)
-    """
-    import os
-    import pandas as pd
-    from importlib import reload
 
     moviePath = "/workspaces/rdflime/rdflime-util/data/metacritic-movies"
     movieFull = pd.read_csv(os.path.join(moviePath, "movies_fixed.tsv"), sep="\t")
     movies = [movie.DBpedia_URI for index, movie in movieFull.iterrows()]
 
-    with open(os.path.join(moviePath, "rdf2vec_transformer_cbow_200"), "rb") as f:
-        rdf2vec_transformer = pickle.load(f)
+    with open(os.path.join(moviePath, "rdf2vec_transformer_cbow_200"), "rb") as file:
+        rdf2vec_transformer = pickle.load(file)
 
     with open(os.path.join(moviePath, "embedding_classifier_cbow_200"), "rb") as file:
         clf = pickle.load(file)
 
     explainer = LimeRdfExplainer(
         transformer=rdf2vec_transformer,
-        entities=movies
+        entities=movies,
+        class_names=clf.classes_,
+        kernel=None,
+        kernel_width=25,
+        verbose=False,
+        feature_selection="auto",
+        random_state=42
     )
-    explained_entity_uri = movies[10]
 
+    explained_entity_id = 1876  # 1600-1999 -> test data
+    explained_entity_uri = movies[explained_entity_id]
+    prediction = clf.predict_proba([rdf2vec_transformer._embeddings[explained_entity_id]])
     print("Explaining", explained_entity_uri)
+    print("Original prediction:", prediction)
+    print("True class:", movieFull.iloc[explained_entity_id].label)
 
-    data, labels, distances, expl = explainer.explain_instance(
+    data, labels, distances, explanation = explainer.explain_instance(
         entity=explained_entity_uri,
         classifier_fn=clf.predict_proba,
-        num_samples=500,
-        max_removed_triples=3,
+        num_features=10,
+        num_samples=1,
+        max_removed_triples=1,
         removal_count_fixed=True,
         use_w2v_freeze=False,
-        center_correction=True,
-        single_run=False,
-        distance_metric="cosine"
+        center_correction=False,
+        single_run=True,
+        distance_metric="cosine",
+        model_regressor=None,
+        short_uris=True
     )
-
-    print(expl.as_list())

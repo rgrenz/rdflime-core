@@ -206,7 +206,7 @@ class LimeRdfExplainer(object):
 
         # Mark random triples as removed, creating a new corpus for artificial entities
         data = np.ones((num_samples, triple_count))
-        new_entities = [f"{entity}_{i}" for i in range(num_samples)]
+        new_entities = [f"{entity}_" for i in range(num_samples)]
         new_corpus = []
 
         for i, removal_count in enumerate(tqdm(sample)):
@@ -263,23 +263,29 @@ class LimeRdfExplainer(object):
             for entity_walk in new_corpus:
                 runs.append([tuple(walk) for walk in entity_walk])
 
+        w2v.build_vocab([tuple(walk)
+                        for entity_walks in new_corpus for walk in entity_walks], update=True)
+        w2v_p = pickle.dumps(self.transformer.embedder._model)
+
         for i, run in enumerate(tqdm(runs)):
-            w2v = pclone(self.transformer.embedder._model)
+            w2v = pickle.loads(w2v_p)  # pclone(self.transformer.embedder._model)
             wv = w2v.wv
 
             if(train_with_all):
                 run = [tuple(walk)
                        for entity_walks in self.transformer._walks for walk in entity_walks] + run
 
-            w2v.build_vocab(run, update=True)
-
             run_entities = new_entities if single_run else [new_entities[i]]
+            # w2v.build_vocab(run, update=True)
+
+            for run_entity in run_entities:
+                wv[run_entity] = np.copy(original_embedding)
 
             freeze_vector_open = np.ones(len(wv)-len(freeze_vector_locked), dtype=np.float32)
             if use_w2v_freeze:
                 # TODO maybe freeze depends on the length of input to train (which is not always the length of the whole corpus)
                 w2v.wv.vectors_lockf = np.concatenate([freeze_vector_locked, freeze_vector_open])
-                print(len(freeze_vector_locked), len(freeze_vector_open))
+                # print(len(freeze_vector_locked), len(freeze_vector_open))
 
             # TODO Throws Value Error when corpus contains entitites with all walks removed
             # ("entities must have been provided to fit first") -> ensure we never remove all walks
@@ -287,7 +293,7 @@ class LimeRdfExplainer(object):
             # Also: displays warning "effective 'Alpha' higher than previous cycles"
 
             w2v.train(run, total_examples=w2v.corpus_count,
-                      epochs=w2v.epochs)  # , start_alpha=w2v.min_alpha) TODO
+                      epochs=w2v.epochs, start_alpha=w2v.min_alpha)
 
             # Add embedding of fake entity to our collection
             # Need to clone vector to avoid memory leak in multi run scenario

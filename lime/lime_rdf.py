@@ -16,12 +16,7 @@ import pickle
 
 from . import explanation
 
-logging.basicConfig(level=logging.WARN)
-
-
-def pclone(o):
-    # poor man's deep copy
-    return pickle.loads(pickle.dumps(o))
+logging.basicConfig(level=logging.INFO)
 
 
 class GraphDomainMapper(explanation.DomainMapper):
@@ -100,12 +95,7 @@ class LimeRdfExplainer(object):
                 return np.sqrt(np.exp(-(d ** 2) / kernel_width ** 2))
         kernel_fn = partial(kernel, kernel_width=kernel_width)
 
-        # Can safely do this since transformer object is serializable by design
-        self.old_transformer = pickle.loads(pickle.dumps(transformer))
-
         self.transformer = transformer
-
-        self.embeddings = transformer._embeddings
         self.entities = entities
         self.indexed_walks = IndexedWalks(entities, transformer._walks, strict_mode=False)
         self.random_state = check_random_state(random_state)
@@ -188,6 +178,7 @@ class LimeRdfExplainer(object):
 
         original_walks = self.indexed_walks.walks(entity)
         original_triples = list(IndexedWalks.walks_as_triples(original_walks))
+
         triple_count = len(original_triples)
 
         num_samples = int(num_samples)
@@ -263,12 +254,16 @@ class LimeRdfExplainer(object):
             for entity_walk in new_corpus:
                 runs.append([tuple(walk) for walk in entity_walk])
 
+        """
         w2v.build_vocab([tuple(walk)
                         for entity_walks in new_corpus for walk in entity_walks], update=True)
+        """
+        w2v.build_vocab([tuple(walk)
+                         for entity_walks in new_corpus for walk in entity_walks], update=True)
         w2v_p = pickle.dumps(self.transformer.embedder._model)
 
         for i, run in enumerate(tqdm(runs)):
-            w2v = pickle.loads(w2v_p)  # pclone(self.transformer.embedder._model)
+            w2v = pickle.loads(w2v_p)
             wv = w2v.wv
 
             if(train_with_all):
@@ -276,7 +271,7 @@ class LimeRdfExplainer(object):
                        for entity_walks in self.transformer._walks for walk in entity_walks] + run
 
             run_entities = new_entities if single_run else [new_entities[i]]
-            # w2v.build_vocab(run, update=True)
+           # w2v.build_vocab(run, update=True)
 
             for run_entity in run_entities:
                 wv[run_entity] = np.copy(original_embedding)
@@ -292,12 +287,12 @@ class LimeRdfExplainer(object):
             #
             # Also: displays warning "effective 'Alpha' higher than previous cycles"
 
-            w2v.train(run, total_examples=w2v.corpus_count,
+            w2v.train(run, total_examples=len(run),  # w2v.corpus_count,
                       epochs=w2v.epochs, start_alpha=w2v.min_alpha)
 
             # Add embedding of fake entity to our collection
             # Need to clone vector to avoid memory leak in multi run scenario
-            new_embeddings += [pclone(wv.get_vector(entity)) for entity in run_entities]
+            new_embeddings += [np.copy(wv.get_vector(entity)) for entity in run_entities]
 
         if center_correction:
             diff_to_center = new_embeddings[0] - original_embedding
@@ -320,14 +315,14 @@ if __name__ == "__main__":
     import os
     import pandas as pd
 
-    moviePath = "/workspaces/rdflime/rdflime-util/data/metacritic-movies"
+    moviePath = "/workspaces/code/rdflime-util/data/metacritic-movies"
     movieFull = pd.read_csv(os.path.join(moviePath, "movies_fixed.tsv"), sep="\t")
     movies = [movie.DBpedia_URI for index, movie in movieFull.iterrows()]
 
-    with open(os.path.join(moviePath, "rdf2vec_transformer_cbow_200"), "rb") as file:
+    with open(os.path.join(moviePath, "transformers", "rdf2vec_transformer_cbow_200"), "rb") as file:
         rdf2vec_transformer = pickle.load(file)
 
-    with open(os.path.join(moviePath, "embedding_classifier_cbow_200"), "rb") as file:
+    with open(os.path.join(moviePath,  "classifiers", "svc_100_cbow_200"), "rb") as file:
         clf = pickle.load(file)
 
     explainer = LimeRdfExplainer(
@@ -341,23 +336,36 @@ if __name__ == "__main__":
         random_state=42
     )
 
-    explained_entity_id = 1876  # 1600-1999 -> test data
+    explained_entity_id = 100  # 0-400 -> test data
     explained_entity_uri = movies[explained_entity_id]
     prediction = clf.predict_proba([rdf2vec_transformer._embeddings[explained_entity_id]])
+
     print("Explaining", explained_entity_uri)
-    print("Original prediction:", prediction)
+    print("Original prediction:", prediction, " / ".join(clf.classes_))
     print("True class:", movieFull.iloc[explained_entity_id].label)
+
+    """
+    Grid search
+    ids = [1662, 1735, 1796, 1856, 1935]
+    max_removed_triples = [1, 10, 25, 100]
+    removal_count_fixed = [True, False]
+    use_w2v_freeze = [True, False]
+    center_correction = [True, False]
+    center_init = [True, False]
+    single_run = [True, False]
+    """
 
     data, labels, distances, explanation = explainer.explain_instance(
         entity=explained_entity_uri,
         classifier_fn=clf.predict_proba,
         num_features=10,
-        num_samples=1,
+        num_samples=10,
         max_removed_triples=1,
         removal_count_fixed=True,
-        use_w2v_freeze=False,
+        use_w2v_freeze=True,
         center_correction=False,
-        single_run=True,
+        single_run=False,
+        train_with_all=False,
         distance_metric="cosine",
         model_regressor=None,
         short_uris=True

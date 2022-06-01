@@ -16,7 +16,7 @@ import pickle
 
 from . import explanation
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.WARN)
 
 
 class GraphDomainMapper(explanation.DomainMapper):
@@ -31,7 +31,7 @@ class GraphDomainMapper(explanation.DomainMapper):
 
         for x in exp:
             triple = self.triples[x[0]]
-            triple = [i.split("/")[-1] if self.short_uris else i for i in list(triple)]
+            triple = tuple([i.split("/")[-1] if self.short_uris else i for i in list(triple)])
             mappings.append((triple, x[1]))
 
         # a = [([list(self.triples[x[0]])], x[1]) for x in exp]
@@ -60,20 +60,32 @@ class IndexedWalks(object):
             for entity, entityWalks in zip(entities, walks):
                 self._walkIndex[entity] = entityWalks
 
-    def walks(self, entity):
-        """Returns all walks for a given entity."""
-        return self._walkIndex[entity]
+    def walks(self, entity, triple=None):
+        """Returns all walks for a given entity (that contain a given triple)."""
+        walks = self._walkIndex[entity]
+        if triple:
+            return [w for w in walks if triple in IndexedWalks.walk_as_triples(w)]
+        return walks
 
     @staticmethod
     def walk_as_triples(walk):
         """Returns all triples within a given walk."""
-        return [(walk[i-2], walk[i-1], walk[i]) for i in range(2, len(walk)-1, 2)]
+        return [(walk[i-2], walk[i-1], walk[i]) for i in range(2, len(walk), 2)]
 
     @staticmethod
     def walks_as_triples(walks):
         """Returns the set of distinct triples within a given list of walks."""
         walkLists = [IndexedWalks.walk_as_triples(walk) for walk in walks]
         return set(itertools.chain.from_iterable(walkLists))
+
+    @staticmethod
+    def walk_contains_triple(walk, triple):
+        return triple in IndexedWalks.walk_as_triples(walk)
+
+    @staticmethod
+    def filter_walks(input_walks, removed_triples):
+        """Returns only the walks from input_walks that contain none of the removed_triples."""
+        return [w for w in input_walks if any([IndexedWalks.walk_contains_triple(w, t) for t in removed_triples])]
 
 
 class LimeRdfExplainer(object):

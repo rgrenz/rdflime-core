@@ -13,7 +13,6 @@ from sklearn.utils import check_random_state
 from pyrdf2vec import RDF2VecTransformer
 import logging
 import pickle
-import random
 
 from . import explanation
 
@@ -122,15 +121,6 @@ class IndexedWalks(object):
         walkLists = [IndexedWalks.walk_as_triples(walk) for walk in walks]
         return set(itertools.chain.from_iterable(walkLists))
 
-    @ staticmethod
-    def walk_contains_triple(walk, triple):
-        return triple in IndexedWalks.walk_as_triples(walk)
-
-    @ staticmethod
-    def filter_walks(input_walks, removed_triples):
-        """Returns only the walks from input_walks that contain none of the removed_triples."""
-        return [w for w in input_walks if any([IndexedWalks.walk_contains_triple(w, t) for t in removed_triples])]
-
 
 class LimeRdfExplainer(object):
     """Explains classifiers based on knowledge graph embeddings."""
@@ -168,7 +158,7 @@ class LimeRdfExplainer(object):
                          num_features=10,
                          num_samples=5000,
                          allow_triple_addition=True,
-                         allow_triple_substraction=True,
+                         allow_triple_subtraction=True,
                          max_changed_triples=None,
                          change_count_fixed=True,
                          use_w2v_freeze=True,
@@ -179,11 +169,12 @@ class LimeRdfExplainer(object):
                          model_regressor=None,
                          short_uris=False):
         """Generates explanations for a prediction."""
+        self.use_w2v_freeze = use_w2v_freeze
 
-        # Compute relevant set of triples for addition / substraction
-        assert allow_triple_addition or allow_triple_substraction, "Either triple addition or substraction must be allowed!"
+        # Compute relevant set of triples for addition / subtraction
+        assert allow_triple_addition or allow_triple_subtraction, "Either triple addition or subtraction must be allowed!"
         existing_triples = IndexedWalks.walks_as_triples(self.indexed_walks.walks(entity))
-        relevant_triples = existing_triples if allow_triple_substraction else set()
+        relevant_triples = existing_triples if allow_triple_subtraction else set()
 
         if allow_triple_addition:
             for triple in self.indexed_walks._adjacent_triples:
@@ -229,6 +220,82 @@ class LimeRdfExplainer(object):
 
         return data, yss, distances, ret_exp
 
+    def get_perturbed_walks(self, entity, added_triples, removed_triples, entity_suffix="_"):
+        """Builds new random walks for an entity"""
+        original_walks = self.indexed_walks.walks(entity)
+        modified_walks = pickle.loads(pickle.dumps(original_walks))
+
+        # 1st phase - remove walks with eliminated triples
+        for t in removed_triples:
+            modified_walks = [
+                w for w in modified_walks if t not in IndexedWalks.walk_as_triples(w)]
+
+        # 2nd phase - mutate walks with added triples
+        for t in added_triples:
+            # Choose a random walk that we would like to apply
+            triple_info = self.indexed_walks._adjacent_triples[t]
+            walk_stub_idx = self.random_state.randint(len(triple_info["walk_stubs"]))
+            walk_stub = triple_info["walk_stubs"][walk_stub_idx]
+
+            # Calculate probability of walk modification
+            degree = self.indexed_walks.node_degree(
+                entity, out_degree=not triple_info["isPrefix"])
+            p_mutate = 1 / (degree + 1)
+
+            # Modify walks
+            for idx, w in enumerate(modified_walks):
+                if self.random_state.random() <= p_mutate:
+                    entity_index = w.index(entity)
+                    if triple_info["isPrefix"]:
+                        w = (*walk_stub, *w[entity_index:])
+                    else:
+                        w = (*w[:entity_index+1], *walk_stub)
+                modified_walks[idx] = w
+
+        # Rename new entity
+        return [
+            tuple([w if w != entity else entity + entity_suffix for w in walk]) for walk in modified_walks
+        ]
+
+    def get_perturbed_embedding(self, entity, perturbed_entity_walks, entity_suffix="_"):
+        """
+            For now we ignore some of the RDF2Vec wrapper functions and talk to W2V directly
+            (to use advanced features such as the freeze functionality)
+            self.transformer.fit(newCorpus, is_update=True)
+            self.transformer._update(self.transformer._embeddings, embeddings)
+            new_embeddings = self.transformer.embedder.transform(new_entities)
+        """
+
+        # Ensure that the vocabulary has already been extended.
+        w2v = self.transformer.embedder._model
+        wv = w2v.wv
+        original_embedding = wv[entity]
+
+        if entity + entity_suffix not in wv:
+            w2v.build_vocab(perturbed_entity_walks, update=True)
+            wv[entity + entity_suffix] = np.copy(original_embedding)
+
+            if self.use_w2v_freeze:
+                freeze_vector = np.zeros(len(wv), dtype=np.float32)
+                freeze_vector[-1] = 1
+                w2v.wv.vectors_lockf = freeze_vector
+
+            self.w2v_dump = pickle.dumps(w2v)
+            self.wv_dump = pickle.dumps(wv)
+
+        # Clone w2v instance
+        w2v = pickle.loads(self.w2v_dump)
+        # w2v.wv = pickle.loads(self.wv_dump)
+        wv = w2v.wv
+
+        # Continue training
+        # w2v.min_alpha_yet_reached = 1
+        w2v.train(perturbed_entity_walks, total_examples=len(perturbed_entity_walks),
+                  epochs=w2v.epochs, start_alpha=w2v.min_alpha)
+
+        # Need to clone vector to avoid memory leak in multi run scenario
+        return np.copy(wv.get_vector(entity + entity_suffix))
+
     def __data_labels_distances(self, entity, relevant_triples, classifier_fn, num_samples,
                                 max_changed_triples=None,
                                 change_count_fixed=True,
@@ -247,158 +314,62 @@ class LimeRdfExplainer(object):
             return sklearn.metrics.pairwise.pairwise_distances(
                 x, x[0], metric=distance_metric).ravel() * 100
 
-        original_walks = self.indexed_walks.walks(entity)
         relevant_triples = list(relevant_triples)
-        triple_count = len(relevant_triples)
-
-        # Triples that actually exist on the entity (that can be subtracted)
-        subtraction_triple_count = len([x for x in relevant_triples if "_" not in x])
-
-        # Triples that do not exist on the entity (that can be added)
-        addition_triple_count = triple_count - subtraction_triple_count
-
         num_samples = int(num_samples)
         max_changed_triples = int(max_changed_triples)
+
+        triple_count = len(relevant_triples)
+        subtraction_triple_count = len([x for x in relevant_triples if "_" not in x])
+        addition_triple_count = triple_count - subtraction_triple_count
+
+        # Prepare regression input data
+        data = np.ones((num_samples, triple_count))
+        data[:, subtraction_triple_count:] = np.zeros((num_samples, addition_triple_count))
 
         # How many triples to change in a specific perturbed sample
         if max_changed_triples is None:
             max_changed_triples = triple_count
 
         if change_count_fixed:
-            # Always change fixed number of triples given in parameter change_count_fixed
             sample = np.ones(num_samples, dtype=np.int64) * max_changed_triples
         else:
-            # Draw the number of removed triples for each perturbed entity at random
             sample = self.random_state.randint(1, max_changed_triples + 1, num_samples)
 
         # Mark random triples as changed, creating a new corpus for artificial entities
-        data = np.ones((num_samples, triple_count))
-        data[:, subtraction_triple_count:] = np.zeros((num_samples, addition_triple_count))
-
-        new_entities = [f"{entity}_" for i in range(num_samples)]
         new_corpus = []
 
-        print("Preparing walks:")
-        for i, change_count in enumerate(tqdm(sample)):
-
-            # Choose inactive triple for this perturbed sample
-            # Special case: first sample is a reference without changes
+        progress_bar = tqdm(sample)
+        progress_bar.set_description("Preparing perturbed walks")
+        for i, change_count in enumerate(progress_bar):
             changed = self.random_state.choice(
                 range(triple_count), change_count, replace=False) if i != 0 else []
 
             data[i, changed] = 1 - data[i, changed]
 
-            # Build new corpus by removing walks that contain inactive triples
-            # changed_triples = [t for i, t in enumerate(relevant_triples) if i in changed]
-            changed_triples = [relevant_triples[idx] for idx in changed]
-            modified_walks = pickle.loads(pickle.dumps(original_walks))
+            removed_triples = [relevant_triples[idx]
+                               for idx in changed if idx < subtraction_triple_count]
+            added_triples = [relevant_triples[idx]
+                             for idx in changed if idx >= subtraction_triple_count]
 
-            # 1st phase - remove walks with eliminated triples
-            for t in [t for t in changed_triples if "_" not in t]:
-                modified_walks = [
-                    w for w in modified_walks if t not in IndexedWalks.walk_as_triples(w)]
-
-            # 2nd phase - mutate walks with added triples
-            for t in [t for t in changed_triples if "_" in t]:
-
-                # Choose a random walk that we would like to apply
-                triple_info = self.indexed_walks._adjacent_triples[t]
-                walk_stub = random.choice(triple_info["walk_stubs"])
-                degree = self.indexed_walks.node_degree(
-                    entity, out_degree=not triple_info["isPrefix"])
-
-                # For every walk with entity of interest, draw random number
-                p_mutate = 1 / (degree + 1)
-                ctr = 0
-                for idx, w in enumerate(modified_walks):
-                    if random.random() <= p_mutate:
-                        ctr += 1
-                        entity_index = w.index(entity)
-                        if triple_info["isPrefix"]:
-                            w = (*walk_stub, *w[entity_index:])
-                        else:
-                            w = (*w[:entity_index+1], *walk_stub)
-                    modified_walks[idx] = w
-
-            # Rename new entity
-            modified_walks = [
-                tuple([w if w != entity else new_entities[i] for w in walk]) for walk in modified_walks
-            ]
+            modified_walks = self.get_perturbed_walks(entity, added_triples, removed_triples)
+            assert len(
+                modified_walks) > 0, "Entity has lost all walks, consider lowering max_changed_triples."
             new_corpus.append(modified_walks)
 
         average_walks = sum([len(x) for x in new_corpus])/len(new_corpus)
         print(f"Average remaining walks per artificial entity (from 484): {average_walks}")
-        # print(new_corpus[0])
-
-        # Get embeddings for new entities
-
-        """
-        For now we ignore some of the RDF2Vec wrapper functions and talk to W2V directly
-        (to use advanced features such as the freeze functionality)
-        self.transformer.fit(newCorpus, is_update=True)
-        self.transformer._update(self.transformer._embeddings, embeddings)
-        new_embeddings = self.transformer.embedder.transform(new_entities)
-        """
-
-        w2v = self.transformer.embedder._model
-        wv = w2v.wv
-        original_embedding = wv.get_vector(entity)
-
-        freeze_vector_locked = np.zeros(len(wv), dtype=np.float32)
 
         new_embeddings = []
-        runs = []
+        progress_bar = tqdm(new_corpus)
+        progress_bar.set_description("Training perturbed W2V embeddings")
+        for i, entity_walks in enumerate(progress_bar):
+            new_embeddings.append(self.get_perturbed_embedding(entity, entity_walks))
 
-        if single_run:  # TODO !
-            runs.append([tuple(walk) for entity_walks in new_corpus for walk in entity_walks])
-        else:
-            for entity_walk in new_corpus:
-                runs.append([tuple(walk) for walk in entity_walk])
-
-        """
-        w2v.build_vocab([tuple(walk)
-                        for entity_walks in new_corpus for walk in entity_walks], update=True)
-        """
-        w2v.build_vocab([tuple(walk)
-                         for entity_walks in new_corpus for walk in entity_walks], update=True)
-        w2v_p = pickle.dumps(self.transformer.embedder._model)
-
-        print("Training W2V with new corpus:")
-        for i, run in enumerate(tqdm(runs)):
-            w2v = pickle.loads(w2v_p)
-            wv = w2v.wv
-
-            if(train_with_all):
-                run = [tuple(walk)
-                       for entity_walks in self.transformer._walks for walk in entity_walks] + run
-
-            run_entities = new_entities if single_run else [new_entities[i]]
-            # w2v.build_vocab(run, update=True)
-
-            for run_entity in run_entities:
-                wv[run_entity] = np.copy(original_embedding)
-
-            freeze_vector_open = np.ones(len(wv)-len(freeze_vector_locked), dtype=np.float32)
-            if use_w2v_freeze:
-                # TODO maybe freeze depends on the length of input to train (which is not always the length of the whole corpus)
-                w2v.wv.vectors_lockf = np.concatenate([freeze_vector_locked, freeze_vector_open])
-                # print(len(freeze_vector_locked), len(freeze_vector_open))
-
-            # TODO Throws Value Error when corpus contains entitites with all walks removed
-            # ("entities must have been provided to fit first") -> ensure we never remove all walks
-            #
-            # Also: displays warning "effective 'Alpha' higher than previous cycles"
-
-            w2v.train(run, total_examples=len(run),  # w2v.corpus_count,
-                      epochs=w2v.epochs, start_alpha=w2v.min_alpha)
-
-            # Add embedding of fake entity to our collection
-            # Need to clone vector to avoid memory leak in multi run scenario
-            new_embeddings += [np.copy(wv.get_vector(entity)) for entity in run_entities]
-
-        if center_correction:
-            diff_to_center = new_embeddings[0] - original_embedding
-            new_embeddings = [e - diff_to_center for e in new_embeddings]
+            """
+            if center_correction:
+                diff_to_center = new_embeddings[0] - original_embedding
+                new_embeddings = [e - diff_to_center for e in new_embeddings]
+            """
 
         # Get prediction probabilities for new embeddings
         labels = classifier_fn(new_embeddings)
@@ -407,8 +378,8 @@ class LimeRdfExplainer(object):
         distances = distance_fn(sp.sparse.csr_matrix(new_embeddings))
 
         # Debug
-        # self.new_corpus = new_corpus
-        # self.new_embeddings = new_embeddings
+        self.new_corpus = new_corpus
+        self.new_embeddings = new_embeddings
 
         return data, labels, distances
 
@@ -462,8 +433,8 @@ if __name__ == "__main__":
         classifier_fn=clf.predict_proba,
         num_features=25,
         num_samples=2,
-        allow_triple_addition=True,
-        allow_triple_substraction=False,
+        allow_triple_addition=False,
+        allow_triple_subtraction=True,
         max_changed_triples=5,
         change_count_fixed=True,
         use_w2v_freeze=True,

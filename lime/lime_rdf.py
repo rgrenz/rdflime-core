@@ -13,6 +13,7 @@ from sklearn.utils import check_random_state
 from pyrdf2vec import RDF2VecTransformer
 import logging
 import pickle
+import random
 
 from . import explanation
 
@@ -20,7 +21,7 @@ logging.basicConfig(level=logging.WARN)
 
 
 class GraphDomainMapper(explanation.DomainMapper):
-    """Maps feature ids to triples"""
+    """Maps feature ids to triples."""
 
     def __init__(self, triples, short_uris):
         self.triples = triples
@@ -34,7 +35,6 @@ class GraphDomainMapper(explanation.DomainMapper):
             triple = tuple([i.split("/")[-1] if self.short_uris else i for i in list(triple)])
             mappings.append((triple, x[1]))
 
-        # a = [([list(self.triples[x[0]])], x[1]) for x in exp]
         return mappings
 
 
@@ -44,8 +44,13 @@ class IndexedWalks(object):
     def __init__(self, entities, walks, strict_mode=False):
         """Initializer."""
 
+        # Key: Entity, Value: Walks
         self._walkIndex = {}
 
+        # Key: Triple, Value: {walks: Walks, isPrefix: boolean}
+        self._adjacent_triples = {}
+
+        """
         if strict_mode:
             # Strict mode: Index walks that have been generated for different entities
             for walk_group in tqdm(walks):
@@ -57,8 +62,40 @@ class IndexedWalks(object):
                             self._walkIndex[entity] = entry
 
         else:
-            for entity, entityWalks in zip(entities, walks):
-                self._walkIndex[entity] = entityWalks
+        """
+        for entity, entityWalks in zip(entities, walks):
+            self._walkIndex[entity] = entityWalks
+
+            for walk in entityWalks:
+                entity_index = walk.index(entity)
+
+                if entity_index != 0:
+                    # There is a prefix triple
+                    # (JonDoe, writer, _)
+                    t = list(walk[entity_index-2:entity_index+1])
+                    t[2] = "_"
+                    t = tuple(t)
+
+                    if t not in self._adjacent_triples:
+                        self._adjacent_triples[t] = {"walk_stubs": [], "isPrefix": True}
+                    stub = walk[:entity_index]
+                    if stub not in self._adjacent_triples[t]["walk_stubs"]:
+                        self._adjacent_triples[t]["walk_stubs"].append(stub)
+
+                if entity_index != len(walk) - 1:
+                    # There is a postifx triple
+                    t = list(walk[entity_index:entity_index+3])
+                    t[0] = "_"
+                    t = tuple(t)
+
+                    if t not in self._adjacent_triples:
+                        self._adjacent_triples[t] = {"walk_stubs": [], "isPrefix": False}
+
+                    stub = walk[entity_index+1:]
+                    if stub not in self._adjacent_triples[t]["walk_stubs"]:
+                        self._adjacent_triples[t]["walk_stubs"].append(stub)
+
+        self._walks = walks
 
     def walks(self, entity, triple=None):
         """Returns all walks for a given entity (that contain a given triple)."""
@@ -67,22 +104,29 @@ class IndexedWalks(object):
             return [w for w in walks if triple in IndexedWalks.walk_as_triples(w)]
         return walks
 
-    @staticmethod
+    def node_degree(self, entity, out_degree=True):
+        # How many other distinct nodes are reached from this node?
+        entity_index = 0 if out_degree else 2
+        triples = IndexedWalks.walks_as_triples(self.walks(entity))
+        relevant_set = {t for t in triples if t[entity_index] == entity}
+        return len(relevant_set)
+
+    @ staticmethod
     def walk_as_triples(walk):
         """Returns all triples within a given walk."""
         return [(walk[i-2], walk[i-1], walk[i]) for i in range(2, len(walk), 2)]
 
-    @staticmethod
+    @ staticmethod
     def walks_as_triples(walks):
         """Returns the set of distinct triples within a given list of walks."""
         walkLists = [IndexedWalks.walk_as_triples(walk) for walk in walks]
         return set(itertools.chain.from_iterable(walkLists))
 
-    @staticmethod
+    @ staticmethod
     def walk_contains_triple(walk, triple):
         return triple in IndexedWalks.walk_as_triples(walk)
 
-    @staticmethod
+    @ staticmethod
     def filter_walks(input_walks, removed_triples):
         """Returns only the walks from input_walks that contain none of the removed_triples."""
         return [w for w in input_walks if any([IndexedWalks.walk_contains_triple(w, t) for t in removed_triples])]
@@ -123,8 +167,10 @@ class LimeRdfExplainer(object):
                          labels=(1,),
                          num_features=10,
                          num_samples=5000,
-                         max_removed_triples=None,
-                         removal_count_fixed=True,
+                         allow_triple_addition=True,
+                         allow_triple_substraction=True,
+                         max_changed_triples=None,
+                         change_count_fixed=True,
                          use_w2v_freeze=True,
                          center_correction=True,
                          single_run=True,
@@ -134,19 +180,33 @@ class LimeRdfExplainer(object):
                          short_uris=False):
         """Generates explanations for a prediction."""
 
+        # Compute relevant set of triples for addition / substraction
+        assert allow_triple_addition or allow_triple_substraction, "Either triple addition or substraction must be allowed!"
+        existing_triples = IndexedWalks.walks_as_triples(self.indexed_walks.walks(entity))
+        relevant_triples = existing_triples if allow_triple_substraction else set()
+
+        if allow_triple_addition:
+            for triple in self.indexed_walks._adjacent_triples:
+                reconstructed_triple = tuple([entity if x == "_" else x for x in triple])
+                if reconstructed_triple not in existing_triples:
+                    # Only allow addition of triples that do not yet exist on the entity
+                    relevant_triples.add(triple)
+
         # Generate and evaluate random neighborhood
         data, yss, distances = self.__data_labels_distances(entity,
+                                                            relevant_triples,
                                                             classifier_fn,
                                                             num_samples,
-                                                            max_removed_triples,
-                                                            removal_count_fixed,
+                                                            max_changed_triples,
+                                                            change_count_fixed,
                                                             use_w2v_freeze,
                                                             center_correction,
                                                             single_run,
                                                             train_with_all,
                                                             distance_metric)
+        print("Got data, labels, and distances")
 
-        relevant_triples = IndexedWalks.walks_as_triples(self.indexed_walks.walks(entity))
+        # Initialize explanation
         domain_mapper = GraphDomainMapper(list(relevant_triples), short_uris)
         ret_exp = explanation.Explanation(
             domain_mapper,
@@ -169,17 +229,16 @@ class LimeRdfExplainer(object):
 
         return data, yss, distances, ret_exp
 
-    def __data_labels_distances(self, entity, classifier_fn, num_samples,
-                                max_removed_triples=None,
-                                removal_count_fixed=True,
+    def __data_labels_distances(self, entity, relevant_triples, classifier_fn, num_samples,
+                                max_changed_triples=None,
+                                change_count_fixed=True,
                                 use_w2v_freeze=True,
                                 center_correction=True,
                                 single_run=True,
                                 train_with_all=False,
                                 distance_metric="cosine"):
         """Generates a neighborhood around a prediction.
-
-        Generates neighborhood data by removing random triples from
+        Generates neighborhood data by changing random triples on
         the instance, and predicting with the classifier. Triples are
         removed by eliminating all walks that contain them.
         """
@@ -189,57 +248,87 @@ class LimeRdfExplainer(object):
                 x, x[0], metric=distance_metric).ravel() * 100
 
         original_walks = self.indexed_walks.walks(entity)
-        original_triples = list(IndexedWalks.walks_as_triples(original_walks))
+        relevant_triples = list(relevant_triples)
+        triple_count = len(relevant_triples)
 
-        triple_count = len(original_triples)
+        # Triples that actually exist on the entity (that can be subtracted)
+        subtraction_triple_count = len([x for x in relevant_triples if "_" not in x])
+
+        # Triples that do not exist on the entity (that can be added)
+        addition_triple_count = triple_count - subtraction_triple_count
 
         num_samples = int(num_samples)
-        max_removed_triples = int(max_removed_triples)
+        max_changed_triples = int(max_changed_triples)
 
-        # How many triples to remove in a specific perturbed sample
-        if max_removed_triples is None:
-            max_removed_triples = triple_count
+        # How many triples to change in a specific perturbed sample
+        if max_changed_triples is None:
+            max_changed_triples = triple_count
 
-        if removal_count_fixed:
-            # Always remove fixed number of triples given in parameter removal_count_fixed
-            sample = np.ones(num_samples, dtype=np.int64) * max_removed_triples
+        if change_count_fixed:
+            # Always change fixed number of triples given in parameter change_count_fixed
+            sample = np.ones(num_samples, dtype=np.int64) * max_changed_triples
         else:
             # Draw the number of removed triples for each perturbed entity at random
-            sample = self.random_state.randint(1, max_removed_triples + 1, num_samples)
+            sample = self.random_state.randint(1, max_changed_triples + 1, num_samples)
 
-        # Mark random triples as removed, creating a new corpus for artificial entities
+        # Mark random triples as changed, creating a new corpus for artificial entities
         data = np.ones((num_samples, triple_count))
+        data[:, subtraction_triple_count:] = np.zeros((num_samples, addition_triple_count))
+
         new_entities = [f"{entity}_" for i in range(num_samples)]
         new_corpus = []
 
-        for i, removal_count in enumerate(tqdm(sample)):
+        print("Preparing walks:")
+        for i, change_count in enumerate(tqdm(sample)):
 
             # Choose inactive triple for this perturbed sample
             # Special case: first sample is a reference without changes
-            inactive = self.random_state.choice(
-                range(triple_count), removal_count, replace=False) if i != 0 else []
-            data[i, inactive] = 0
+            changed = self.random_state.choice(
+                range(triple_count), change_count, replace=False) if i != 0 else []
+
+            data[i, changed] = 1 - data[i, changed]
 
             # Build new corpus by removing walks that contain inactive triples
-            removed_triples = [t for i, t in enumerate(original_triples) if i in inactive]
-            remaining_walks = []
+            # changed_triples = [t for i, t in enumerate(relevant_triples) if i in changed]
+            changed_triples = [relevant_triples[idx] for idx in changed]
+            modified_walks = pickle.loads(pickle.dumps(original_walks))
 
-            for walk in original_walks:
-                walkTriples = IndexedWalks.walk_as_triples(walk)
+            # 1st phase - remove walks with eliminated triples
+            for t in [t for t in changed_triples if "_" not in t]:
+                modified_walks = [
+                    w for w in modified_walks if t not in IndexedWalks.walk_as_triples(w)]
 
-                if any([removed in walkTriples for removed in removed_triples]):
-                    # TODO should we also mark "collateral damage" triples as removed?
-                    continue
+            # 2nd phase - mutate walks with added triples
+            for t in [t for t in changed_triples if "_" in t]:
 
-                # Rename entity of interest
-                modifiedWalk = [new_entities[i] if e == entity else e for e in walk]
+                # Choose a random walk that we would like to apply
+                triple_info = self.indexed_walks._adjacent_triples[t]
+                walk_stub = random.choice(triple_info["walk_stubs"])
+                degree = self.indexed_walks.node_degree(
+                    entity, out_degree=not triple_info["isPrefix"])
 
-                remaining_walks.append(modifiedWalk)
+                # For every walk with entity of interest, draw random number
+                p_mutate = 1 / (degree + 1)
+                ctr = 0
+                for idx, w in enumerate(modified_walks):
+                    if random.random() <= p_mutate:
+                        ctr += 1
+                        entity_index = w.index(entity)
+                        if triple_info["isPrefix"]:
+                            w = (*walk_stub, *w[entity_index:])
+                        else:
+                            w = (*w[:entity_index+1], *walk_stub)
+                    modified_walks[idx] = w
 
-            new_corpus.append(remaining_walks)
+            # Rename new entity
+            modified_walks = [
+                tuple([w if w != entity else new_entities[i] for w in walk]) for walk in modified_walks
+            ]
+            new_corpus.append(modified_walks)
 
         average_walks = sum([len(x) for x in new_corpus])/len(new_corpus)
         print(f"Average remaining walks per artificial entity (from 484): {average_walks}")
+        # print(new_corpus[0])
 
         # Get embeddings for new entities
 
@@ -274,6 +363,7 @@ class LimeRdfExplainer(object):
                          for entity_walks in new_corpus for walk in entity_walks], update=True)
         w2v_p = pickle.dumps(self.transformer.embedder._model)
 
+        print("Training W2V with new corpus:")
         for i, run in enumerate(tqdm(runs)):
             w2v = pickle.loads(w2v_p)
             wv = w2v.wv
@@ -283,7 +373,7 @@ class LimeRdfExplainer(object):
                        for entity_walks in self.transformer._walks for walk in entity_walks] + run
 
             run_entities = new_entities if single_run else [new_entities[i]]
-           # w2v.build_vocab(run, update=True)
+            # w2v.build_vocab(run, update=True)
 
             for run_entity in run_entities:
                 wv[run_entity] = np.copy(original_embedding)
@@ -317,8 +407,8 @@ class LimeRdfExplainer(object):
         distances = distance_fn(sp.sparse.csr_matrix(new_embeddings))
 
         # Debug
-        self.new_corpus = new_corpus
-        self.new_embeddings = new_embeddings
+        # self.new_corpus = new_corpus
+        # self.new_embeddings = new_embeddings
 
         return data, labels, distances
 
@@ -327,7 +417,7 @@ if __name__ == "__main__":
     import os
     import pandas as pd
 
-    moviePath = "/workspaces/code/rdflime-util/data/metacritic-movies"
+    moviePath = "/workspaces/rdflime/rdflime-util/data/metacritic-movies"
     movieFull = pd.read_csv(os.path.join(moviePath, "movies_fixed.tsv"), sep="\t")
     movies = [movie.DBpedia_URI for index, movie in movieFull.iterrows()]
 
@@ -359,8 +449,8 @@ if __name__ == "__main__":
     """
     Grid search
     ids = [1662, 1735, 1796, 1856, 1935]
-    max_removed_triples = [1, 10, 25, 100]
-    removal_count_fixed = [True, False]
+    max_changed_triples = [1, 10, 25, 100]
+    change_count_fixed = [True, False]
     use_w2v_freeze = [True, False]
     center_correction = [True, False]
     center_init = [True, False]
@@ -370,15 +460,17 @@ if __name__ == "__main__":
     data, labels, distances, explanation = explainer.explain_instance(
         entity=explained_entity_uri,
         classifier_fn=clf.predict_proba,
-        num_features=10,
-        num_samples=10,
-        max_removed_triples=1,
-        removal_count_fixed=True,
+        num_features=25,
+        num_samples=2,
+        allow_triple_addition=True,
+        allow_triple_substraction=False,
+        max_changed_triples=5,
+        change_count_fixed=True,
         use_w2v_freeze=True,
         center_correction=False,
         single_run=False,
         train_with_all=False,
         distance_metric="cosine",
         model_regressor=None,
-        short_uris=True
+        short_uris=False
     )

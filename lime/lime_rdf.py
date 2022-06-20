@@ -173,15 +173,15 @@ class LimeRdfExplainer(object):
 
         # Compute relevant set of triples for addition / subtraction
         assert allow_triple_addition or allow_triple_subtraction, "Either triple addition or subtraction must be allowed!"
-        existing_triples = IndexedWalks.walks_as_triples(self.indexed_walks.walks(entity))
-        relevant_triples = existing_triples if allow_triple_subtraction else set()
+        existing_triples = list(IndexedWalks.walks_as_triples(self.indexed_walks.walks(entity)))
+        relevant_triples = existing_triples if allow_triple_subtraction else []
 
         if allow_triple_addition:
             for triple in self.indexed_walks._adjacent_triples:
                 reconstructed_triple = tuple([entity if x == "_" else x for x in triple])
                 if reconstructed_triple not in existing_triples:
                     # Only allow addition of triples that do not yet exist on the entity
-                    relevant_triples.add(triple)
+                    relevant_triples.append(triple)
 
         # Generate and evaluate random neighborhood
         data, yss, distances = self.__data_labels_distances(entity,
@@ -229,6 +229,13 @@ class LimeRdfExplainer(object):
         for t in removed_triples:
             modified_walks = [
                 w for w in modified_walks if t not in IndexedWalks.walk_as_triples(w)]
+
+            """
+            n_removed = len(original_walks) - len(modified_walks)
+            replacement_indices = self.random_state.choice(range(len(modified_walks)), n_removed)
+            modified_walks.extend([pickle.loads(pickle.dumps(modified_walks[idx]))
+                                  for idx in replacement_indices])
+            """
 
         # 2nd phase - mutate walks with added triples
         for t in added_triples:
@@ -428,14 +435,14 @@ if __name__ == "__main__":
     single_run = [True, False]
     """
 
-    data, labels, distances, explanation = explainer.explain_instance(
+    data, probabilities, distances, explanation = explainer.explain_instance(
         entity=explained_entity_uri,
         classifier_fn=clf.predict_proba,
-        num_features=25,
-        num_samples=2,
+        num_features=50,
+        num_samples=5000,
         allow_triple_addition=False,
         allow_triple_subtraction=True,
-        max_changed_triples=5,
+        max_changed_triples=20,
         change_count_fixed=True,
         use_w2v_freeze=True,
         center_correction=False,

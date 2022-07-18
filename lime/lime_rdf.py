@@ -195,6 +195,8 @@ class LimeRdfExplainer(object):
                                                             single_run,
                                                             train_with_all,
                                                             distance_metric)
+        if self.class_names is None:
+            self.class_names = [str(x) for x in range(yss[0].shape[0])]
         print("Got data, labels, and distances")
 
         # Initialize explanation
